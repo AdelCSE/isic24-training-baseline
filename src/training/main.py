@@ -160,7 +160,7 @@ def get_scheduler(optimizer, t_max):
 
 def downsample_data(df, multiplier):
     df_positive = df[df.target == 1].reset_index(drop=True)
-    df_negative = df[df.target == 0].iloc[-df_positive.shape[0] * multiplier:].reset_index(drop=True)
+    df_negative = df[df.target == 0].iloc[df_positive.shape[0] * multiplier:].reset_index(drop=True)
 
     df  = pd.concat([df_positive, df_negative]).reset_index(drop=True)
 
