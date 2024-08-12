@@ -2,30 +2,46 @@ import io
 import sys
 import h5py
 import numpy as np
+import pandas as pd
 from PIL import Image
 from torch.utils.data import Dataset
+from typing import Callable, Optional
 
 sys.path.append('../..')
 from src.utils import remove_black_border
 
 class ISICDataset(Dataset):
-    def __init__(self, df, hdf5_file, transforms=None):
+    def __init__(self, 
+                 df : str | pd.DataFrame, 
+                 hdf5_file : str | h5py.File, 
+                 transforms : Optional[Callable] = None
+                 ) -> None:
+        
+        super().__init__()
+        
         self.hdf5 = h5py.File(hdf5_file, mode='r')
-        self.df = df
-        self.ids = self.df['isic_id'].values
-        self.targets = self.df['target'].values
+        self.metadata = df
         self.transforms = transforms
 
     def __len__(self):
-        return len(self.df)
+        return self.metadata.shape[0]
 
-    def __getitem__(self, idx):
-        id = self.ids[idx]
-        target = self.targets[idx]
-        img = np.array(Image.open(io.BytesIO(self.hdf5[id][()])))
+    def __getitem__(self, index):
 
+        # Get indexed row
+        row = self.metadata.iloc[index]
+
+        # Get the target
+        target = row['target']
+
+        # Get the image
+        image_id = row['isic_id']
+        img = np.array(Image.open(io.BytesIO(self.hdf5[image_id ][()])))
+        
+        # Remove black border in the image
         img = remove_black_border(img)
 
+        # Apply image transformations
         if self.transforms:
             img = self.transforms(image=img)['image']
 

@@ -1,1 +1,2 @@
-from .isic_model import *
+from .coat_model import *
+from .eva_model import *

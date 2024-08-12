@@ -12,20 +12,20 @@ from torch.utils.data import DataLoader
 from sklearn.model_selection import StratifiedGroupKFold
 
 sys.path.append('../..')
-from src.datasets import ISICTrainDataset, ISICDataset
-from src.models import ISICModel
+from src.datasets import ISICDataset
+from src.models import CoATNet, EVA02
 from src.trainer import Trainer
 from src.utils import load_env_vars, history2df
 
 
 class DEFAULT:
     SEED = 42
-    NUM_EPOCHS = 10
+    NUM_EPOCHS = 5
     IN_CHANNELS = 3
-    TRAIN_BATCH_SIZE = 8 # 16 for eva
+    TRAIN_BATCH_SIZE = 8
     VALID_BATCH_SIZE = 64
-    NEG_SAMPLES_MULTIPLIER = 20
-    LEARNING_RATE = 1e-5
+    NEG_SAMPLES_MULTIPLIER = 8
+    LEARNING_RATE = 1e-4
     NUM_ACCUMULATION = 1
     WEIGHT_DECAY = 1e-6
     MIN_LR = 1e-6
@@ -34,8 +34,6 @@ class DEFAULT:
     T_MAX = 500
     SEED = 42
     SCHEDULER = 'CosineAnnealingLR'
-    SPLITS_DIR = '/home/bracs/Desktop/skin_cancer_detection/data/isic_2024/splits.pkl'
-
 
 class EVA02_PARAMS:
     MODEL_NAME = 'eva02_small_patch14_336.mim_in22k_ft_in1k'
@@ -62,7 +60,7 @@ def seed_everything(seed: int):
 
 def create_loaders(args, df_train, df_valid, hdf5_file, data_transforms):        
 
-    train_dataset = ISICTrainDataset(df=df_train, hdf5_file=hdf5_file, transforms=data_transforms['train'])
+    train_dataset = ISICDataset(df=df_train, hdf5_file=hdf5_file, transforms=data_transforms['train'])
 
     train_loader = DataLoader(dataset=train_dataset, 
                               batch_size=DEFAULT.TRAIN_BATCH_SIZE, 
@@ -122,14 +120,14 @@ def create_model(args) -> tuple[nn.Module, nn.Module]:
 
     if args.model == 'eva02':
 
-        model = ISICModel(model_name=EVA02_PARAMS.MODEL_NAME,
+        model = EVA02(model_name=EVA02_PARAMS.MODEL_NAME,
                           in_channels=DEFAULT.IN_CHANNELS,
                           num_classes=GLOBAL.NUM_CLASSES,
                           pretrained=True
                           ).to(GLOBAL.DEVICE)
             
     elif args.model == 'coatnet':
-        model = ISICModel(model_name=COATNET_PARAMS.MODEL_NAME,
+        model = CoATNet(model_name=COATNET_PARAMS.MODEL_NAME,
                             in_channels=DEFAULT.IN_CHANNELS,
                             num_classes=GLOBAL.NUM_CLASSES,
                             pretrained=True
@@ -160,7 +158,7 @@ def get_scheduler(optimizer, t_max):
 
 def downsample_data(df, multiplier):
     df_positive = df[df.target == 1].reset_index(drop=True)
-    df_negative = df[df.target == 0].iloc[df_positive.shape[0] * multiplier:].reset_index(drop=True)
+    df_negative = df[df.target == 0].sample(n=multiplier * df_positive.shape[0], random_state=DEFAULT.SEED).reset_index(drop=True)
 
     df  = pd.concat([df_positive, df_negative]).reset_index(drop=True)
 
@@ -206,7 +204,6 @@ def main(args):
     if(args.mode == 'cv'):
         # Straified Group KFold
 
-        #splits = joblib.load(DEFAULT.SPLITS_DIR)
         sgkf = StratifiedGroupKFold(n_splits=DEFAULT.NUM_FOLDS, shuffle=True, random_state=DEFAULT.SEED)
         for fold, (train_idx, valid_idx) in enumerate(sgkf.split(X=df, y=df.target, groups=df.patient_id)):
     
