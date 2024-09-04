@@ -1,7 +1,6 @@
 import os
 import sys
 import torch
-import joblib
 import argparse
 import numpy as np
 import pandas as pd
@@ -10,10 +9,11 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from torch.utils.data import DataLoader
 from sklearn.model_selection import StratifiedGroupKFold
+from torch.utils.data import WeightedRandomSampler
 
 sys.path.append('../..')
-from src.datasets import ISICDataset
-from src.models import CoATNet, EVA02
+from src.datasets import ISICDataset, ISICTrainDataset
+from src.models import CoATNet, EVA02, EffNet, ConvNext
 from src.trainer import Trainer
 from src.utils import load_env_vars, history2df
 
@@ -22,10 +22,10 @@ class DEFAULT:
     SEED = 42
     NUM_EPOCHS = 5
     IN_CHANNELS = 3
-    TRAIN_BATCH_SIZE = 8
+    TRAIN_BATCH_SIZE = 16
     VALID_BATCH_SIZE = 64
-    NEG_SAMPLES_MULTIPLIER = 8
-    LEARNING_RATE = 1e-4
+    NEG_SAMPLES_MULTIPLIER = 20
+    LEARNING_RATE = 1e-5
     NUM_ACCUMULATION = 1
     WEIGHT_DECAY = 1e-6
     MIN_LR = 1e-6
@@ -35,13 +35,22 @@ class DEFAULT:
     SEED = 42
     SCHEDULER = 'CosineAnnealingLR'
 
+
 class EVA02_PARAMS:
     MODEL_NAME = 'eva02_small_patch14_336.mim_in22k_ft_in1k'
     IMG_SIZE = 336
 
 class COATNET_PARAMS:
-    MODEL_NAME = 'coatnet_rmlp_2_rw_224.sw_in1k'
+    MODEL_NAME = 'maxvit_tiny_tf_224.in1k'
     IMG_SIZE = 224
+
+class EFFNET_PARAMS:
+    MODEL_NAME = 'tf_efficientnet_b0_ns'
+    IMG_SIZE = 384
+
+class CONVNEXT_PARAMS:
+    MODEL_NAME = 'convnext_tiny.fb_in22k_ft_in1k_384'
+    IMG_SIZE = 384
     
 class GLOBAL:
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -60,12 +69,12 @@ def seed_everything(seed: int):
 
 def create_loaders(args, df_train, df_valid, hdf5_file, data_transforms):        
 
-    train_dataset = ISICDataset(df=df_train, hdf5_file=hdf5_file, transforms=data_transforms['train'])
+    train_dataset = ISICTrainDataset(df=df_train, hdf5_file=hdf5_file, transforms=data_transforms['train'])
 
     train_loader = DataLoader(dataset=train_dataset, 
                               batch_size=DEFAULT.TRAIN_BATCH_SIZE, 
+                              pin_memory=True,
                               shuffle=True,
-                              pin_memory=True, 
                               drop_last=True, 
                               num_workers=args.num_workers,
                               prefetch_factor=args.prefetch_factor)
@@ -132,6 +141,20 @@ def create_model(args) -> tuple[nn.Module, nn.Module]:
                             num_classes=GLOBAL.NUM_CLASSES,
                             pretrained=True
                             ).to(GLOBAL.DEVICE)
+    
+    elif args.model == 'convnext':
+        model = ConvNext(model_name=CONVNEXT_PARAMS.MODEL_NAME,
+                            in_channels=DEFAULT.IN_CHANNELS,
+                            num_classes=GLOBAL.NUM_CLASSES,
+                            pretrained=True
+                            ).to(GLOBAL.DEVICE)
+    
+    elif args.model == 'effnet':
+        model = EffNet(model_name=EFFNET_PARAMS.MODEL_NAME,
+                            in_channels=DEFAULT.IN_CHANNELS,
+                            num_classes=GLOBAL.NUM_CLASSES,
+                            pretrained=True
+                            ).to(GLOBAL.DEVICE)
 
     else:
         raise Exception(f'Model Not Found Error: {args.model} is not a valid model name.')
@@ -157,10 +180,11 @@ def get_scheduler(optimizer, t_max):
     return scheduler
 
 def downsample_data(df, multiplier):
-    df_positive = df[df.target == 1].reset_index(drop=True)
-    df_negative = df[df.target == 0].sample(n=multiplier * df_positive.shape[0], random_state=DEFAULT.SEED).reset_index(drop=True)
 
-    df  = pd.concat([df_positive, df_negative]).reset_index(drop=True)
+    df_positive = df[df["target"] == 1].reset_index(drop=True)
+    df_negative = df[df["target"] == 0].reset_index(drop=True)
+
+    df = pd.concat([df_positive, df_negative.iloc[:df_positive.shape[0]*multiplier, :]]).reset_index(drop=True)
 
     return df
 
@@ -194,9 +218,15 @@ def main(args):
     # Load data
     df = pd.read_csv(os.path.join(data_dir, 'train-metadata.csv'), low_memory=False)
 
+    df = downsample_data(df, multiplier=20)
+
     # Get data transforms
     if args.model == 'coatnet':
         data_transforms = create_transforms(image_size=COATNET_PARAMS.IMG_SIZE)
+    elif args.model == 'effnet':
+        data_transforms = create_transforms(image_size=EFFNET_PARAMS.IMG_SIZE)
+    elif args.model == 'convnext':
+        data_transforms = create_transforms(image_size=CONVNEXT_PARAMS.IMG_SIZE)
     else:
         data_transforms = create_transforms(image_size=EVA02_PARAMS.IMG_SIZE)
     hdf5_file_path = os.path.join(data_dir, 'train-image.hdf5')
@@ -204,17 +234,15 @@ def main(args):
     if(args.mode == 'cv'):
         # Straified Group KFold
 
-        sgkf = StratifiedGroupKFold(n_splits=DEFAULT.NUM_FOLDS, shuffle=True, random_state=DEFAULT.SEED)
+        sgkf = StratifiedGroupKFold(n_splits=DEFAULT.NUM_FOLDS)
         for fold, (train_idx, valid_idx) in enumerate(sgkf.split(X=df, y=df.target, groups=df.patient_id)):
     
-            print(f'\n Training Fold: {fold + 1} \n')
+            print(f'\nTraining Fold: {fold + 1} \n')
 
             df_train = df.loc[train_idx].reset_index(drop=True)
             df_valid = df.loc[valid_idx].reset_index(drop=True)
 
-            df_train = downsample_data(df_train, DEFAULT.NEG_SAMPLES_MULTIPLIER)
-
-            print(f'Fold data downsampled to: {df_train[df_train.target == 1].shape[0]} Positives and {df_train[df_train.target == 0].shape[0]} Negatives\n')
+            print(f'Training with {df_train.shape[0]} samples: {df_train[df_train.target == 1].shape[0]} Positives and {df_train[df_train.target == 0].shape[0]} Negatives\n')
                 
             # Get data loaders
             train_loader, valid_loader = create_loaders(args, df_train=df_train, df_valid=df_valid, hdf5_file=hdf5_file_path, data_transforms=data_transforms)
@@ -236,15 +264,11 @@ def main(args):
                 .set_scheduler(scheduler=scheduler) \
                 .set_device(device=GLOBAL.DEVICE)
             
-            if fold == 0:
-                # Start training
-                trainer.train(model=model, train_loader=train_loader, val_loader=valid_loader, num_accum=DEFAULT.NUM_ACCUMULATION, fold=fold, num_epochs=args.epochs)
-                
-                # Save history
-                history2df(trainer.history).to_csv(os.path.join(histories_dir, f'fold_{fold}.csv'), index=False)
+            # Start training
+            trainer.train(model=model, train_loader=train_loader, val_loader=valid_loader, num_accum=DEFAULT.NUM_ACCUMULATION, fold=fold, num_epochs=args.epochs)
             
-            else:
-                print('Skipping fold {}!'.format(fold + 1))
+            # Save history
+            history2df(trainer.history).to_csv(os.path.join(histories_dir, f'fold_{fold}.csv'), index=False)
 
     else:
         # Train on whole dataset
@@ -280,7 +304,7 @@ if __name__ =='__main__':
     parser = argparse.ArgumentParser()
 
     ### General Arguments
-    parser.add_argument("--model", type=str, choices=['eva02', 'coatnet'], required=True, help="Model name to train!")
+    parser.add_argument("--model", type=str, choices=['eva02', 'coatnet', 'effnet', 'convnext'], required=True, help="Model name to train!")
     parser.add_argument("--data-folder", type=str, choices=['isic_2024'], required=True, help="Data directory name!")
     parser.add_argument("--weights-folder", type=str, required=True, help="Folder to save model weights!")
     parser.add_argument("--histories-folder", type=str, required=True, help="Folder to save training histories!")

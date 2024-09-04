@@ -33,6 +33,7 @@ class ISICDataset(Dataset):
 
         # Get the target
         target = row['target']
+        id = row['isic_id']
 
         # Get the image
         image_id = row['isic_id']
@@ -45,4 +46,4 @@ class ISICDataset(Dataset):
         if self.transforms:
             img = self.transforms(image=img)['image']
 
-        return {'image': img, 'target': target}
+        return {'isic_id': id, 'image': img, 'target': target}
